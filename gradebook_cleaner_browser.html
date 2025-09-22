@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>학교생활기록부 성적 정규화 도구 (브라우저 버전)</title>
+  <style>
+    :root { --bg:#0b1020; --card:#121831; --muted:#9fb3ff; --text:#eaf0ff; --accent:#7da6ff; }
+    html,body{height:100%;}
+    body{margin:0; font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,Apple Color Emoji; background:linear-gradient(180deg,#0b1020,#0a0f1d); color:var(--text);} 
+    .wrap{max-width:1100px;margin:32px auto;padding:0 16px 48px;}
+    .card{background:var(--card); border:1px solid #1a244a; border-radius:16px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    h1{font-size:22px;margin:0 0 12px;}
+    .muted{color:var(--muted); font-size:14px;}
+    .controls{display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:16px}
+    .controls .full{grid-column:1/-1}
+    label{font-size:13px; color:#bfcbff; display:block; margin:6px 0}
+    input,select,button{background:#0c1330; color:var(--text); border:1px solid #25326a; border-radius:10px; padding:10px 12px; font-size:14px; width:100%}
+    input[type="file"]{padding:8px;}
+    button{cursor:pointer; border:1px solid #3550b9; background:linear-gradient(180deg,#2441a7,#1b2d7a); font-weight:600}
+    button.secondary{background:#0c1330; border-color:#2a3f96}
+    .row{display:flex; gap:10px; flex-wrap:wrap; margin-top:10px}
+    .row > *{flex:1}
+    table{border-collapse:collapse; width:100%; font-size:13px}
+    th,td{border-bottom:1px solid #24316a; padding:6px 8px; text-align:left;}
+    thead th{position:sticky; top:0; background:#0f1840; z-index:1}
+    .scroll{max-height:420px; overflow:auto; border:1px solid #1a244a; border-radius:12px}
+    .pill{display:inline-block; padding:4px 8px; border:1px solid #2a3f96; border-radius:999px; font-size:12px; color:#caddff}
+    .footer{margin-top:12px; font-size:12px; color:#b8c6ff}
+    .hint{font-size:12px; color:#b8c6ff}
+    .ok{color:#a3ffb0}
+    .warn{color:#ffd29a}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>학교생활기록부 성적 정규화 도구 <span class="pill">브라우저</span></h1>
+      <div class="muted">엑셀(XLSX/CSV)을 업로드하면, A–D열 공란을 위 행 값으로 채우고, 중간 헤더·요약 행을 제거하여 DB에 넣기 좋은 CSV로 변환합니다.</div>
+
+      <div class="controls">
+        <div class="full">
+          <label>원본 파일 (XLSX 또는 CSV)</label>
+          <input id="file" type="file" accept=".xlsx,.xls,.csv" />
+        </div>
+        
+        <div>
+          <label>시트 선택</label>
+          <select id="sheet"></select>
+          <div class="hint">파일 선택 시 자동으로 채워집니다</div>
+        </div>
+        <div>
+          <label>미리보기 행 수</label>
+          <input id="previewCount" type="number" value="200" min="20" />
+        </div>
+        <div class="full row">
+          <button id="btnClean">정리해서 미리보기</button>
+          <button id="btnDownloadCsv" class="secondary">CSV 다운로드</button>
+          <button id="btnDownloadXlsx" class="secondary">XLSX 다운로드</button>
+        </div>
+      </div>
+
+      <div id="status" class="footer" style="margin-top:16px"></div>
+
+      <div id="preview" class="scroll" style="margin-top:16px; display:none"></div>
+    </div>
+  </div>
+
+<script>
+// -------------- 유틸 --------------
+const strip = (s) => (typeof s === 'string' ? s.replace(/\s+/g,'') : s);
+function normalizeKeys(row){ const out={}; for(const k in row){ out[strip(k)] = row[k]; } return out; }
+function toNum(v){
+  if (v == null) return null;
+  const s = typeof v === 'string' ? v.trim() : v;
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isNaN(n) ? null : n;
+}
+function parseScoreAvg(v){
+  if (v == null || v === '') return { 원점수:null, 과목평균:null };
+  const s = String(v).trim();
+  if (s.includes('/')){ const [L,R] = s.split('/',2); return { 원점수: toNum(L), 과목평균: toNum(R) }; }
+  return { 원점수: toNum(s), 과목평균: null };
+}
+function parseDistribution(dist){
+  const res = { A_pct:null, B_pct:null, C_pct:null, D_pct:null, E_pct:null };
+  if (dist == null || dist === '') return res;
+  const re = /([A-E])\s*\(\s*([\d.]+)\s*\)/g; let m; const s = String(dist);
+  while((m=re.exec(s))){ const g=m[1]; const v = Number(m[2]); if(!Number.isNaN(v)) res[g+"_pct"] = v; }
+  return res;
+}
+// 학년/반 텍스트 파서: 다양한 표기를 허용
+function parseClassText(text){
+  if (!text) return { year:null, klass:null };
+  let s = String(text).replace(/\u00A0/g,' ').trim();
+  // 전각 숫자 -> 반각
+  const fw = '０１２３４５６７８９'; const hw='0123456789';
+  s = s.replace(/[０-９]/g, ch => hw[fw.indexOf(ch)]);
+  // 한글 숫자(단자리) -> 아라비아
+  const map = { '일':'1','이':'2','삼':'3','사':'4','오':'5','육':'6','칠':'7','팔':'8','구':'9' };
+  s = s.replace(/([일이삼사오육칠팔구])\s*(학\s*년|반)/g, (_,d,unit) => map[d] + unit.replace(/\s+/g,''));
+  // 1) 명시적 패턴: 1학년 2반
+  let m = s.match(/(\d+)\s*학\s*년[^\d]*?(\d+)\s*반/i);
+  if (m) return { year: Number(m[1]), klass: Number(m[2]) };
+  // 2) 각각 따로 존재
+  let y = s.match(/(\d+)\s*학\s*년/i); let k = s.match(/(\d+)\s*반/i);
+  if (y || k) return { year: y?Number(y[1]):null, klass: k?Number(k[1]):null };
+  // 3) 하이픈/슬래시: 1-2, 1/2
+  m = s.match(/(\d+)\s*[-~\/\.]\s*(\d+)/);
+  if (m) return { year:Number(m[1]), klass:Number(m[2]) };
+  // 4) 숫자 두 개 추출
+  const nums = (s.match(/\d+/g) || []).map(n=>Number(n));
+  if (nums.length >= 2) return { year:nums[0], klass:nums[1] };
+  return { year:null, klass:null };
+}
+function isHeaderLike(row){
+  const vals = Object.values(row).map(v => v==null?"":String(v));
+  const first = vals[0]||'';
+  return first.includes('번 호') || vals.includes('성 명') || vals.includes('학 년') || vals.includes('학 기');
+}
+function isSummaryOrPageRow(row){
+  const vals = Object.values(row).map(v => v==null?"":String(v));
+  const first = vals[0];
+  const subj = row['과목'] || row['과목명'] || row['과목코드'];
+  if (/이수학점/.test(first)) return true; // 이수학점 합계
+  if (/^\s*\d+\s*\/\s*\d+\s*$/.test(first) && Object.keys(row).length <= 3) return true; // 페이지 표기
+  if ((first === '' || first === 'None') && (!subj || String(subj).trim()==='')) return true; // 빈 행
+  return false;
+}
+
+function cleanGradebook(rows, classInfo){
+  // 1) 키 정규화
+  let data = rows.map(normalizeKeys);
+  // 2) 헤더/요약/페이지 행 제거
+  data = data.filter(r => !isHeaderLike(r) && !isSummaryOrPageRow(r));
+  // 3) forward-fill: 번호, 성명, 학년, 학기, 반
+  const idKeys = ['번호','성명','학년','학기','반'];
+  const last = { 번호:null, 성명:null, 학년:null, 학기:null, 반:null };
+  data = data.map(r => { for(const k of idKeys){ if(r[k]==null || r[k]===''){ r[k]=last[k]; } else { last[k]=r[k]; } } return r; });
+  // 4) 숫자형 변환
+  ['번호','학년','반','학기','학점','석차등급','수강자수'].forEach(k => data.forEach(r => { if (k in r) r[k] = toNum(r[k]); }));
+  // 5) 교과 키 통일 (기본 컬럼만 사용하도록 최소화)
+  data.forEach(r => { if (r['교과']==null && r['교과명']!=null) r['교과']=r['교과명']; if (r['교과']==null && r['교과군']!=null) r['교과']=r['교과군']; });
+  // 6) 학년/반 추출: A3 셀(classInfo)만 사용 (강화된 파서)
+  let { year:fallbackYear, klass:fallbackClass } = parseClassText(classInfo);
+  if (classInfo){
+    // 메타 보존
+    const {year:담당학년, klass:담당반} = parseClassText(classInfo);
+    data.forEach(r=>{ r['담당학년']=담당학년 ?? null; r['담당반']=담당반 ?? null; r['반표기']=classInfo; });
+  }
+  // 데이터에 학년/반 없으면 보강
+  data.forEach(r => {
+    if ((r['학년']==null || r['학년']==='') && fallbackYear!=null) r['학년'] = fallbackYear;
+    if ((r['반']==null || r['반']==='' || r['반']===0)){
+      if (r['담당반']!=null) r['반'] = r['담당반'];
+      else if (fallbackClass!=null) r['반'] = fallbackClass;
+    }
+  });
+  // 이름 컬럼 보강: 성명 -> 이름 매핑
+  data.forEach(r => { if (r['이름']==null && r['성명']!=null) r['이름'] = r['성명']; });
+  // 7) 과목 없는 행 제거
+  data = data.filter(r => { const subj = r['과목'] ?? r['과 목']; return subj!=null && String(subj).trim()!==''; });
+  // 8) 최소 필요 컬럼만 출력 (요구사항):
+  //    현재학년/현재반: A3에서 추출, 번호: A열(번호), 이름: B열(성명/이름),
+  //    과목학년: C열(학년), 과목학기: D열(학기), 교과: E열(교과), 과목명: F열(과목), 학점: G열(학점)
+  const makeRow = (r) => ({
+    학년: fallbackYear ?? null,
+    반: fallbackClass ?? null,
+    번호: r['번호'] ?? null,
+    이름: r['이름'] ?? r['성명'] ?? null,
+    과목학년: r['학년'] ?? null,
+    과목학기: r['학기'] ?? null,
+    교과: r['교과'] ?? null,
+    과목명: r['과목'] ?? null,
+    학점: r['학점'] ?? null,
+  });
+  const rowsOut = data.map(makeRow);
+  const columns = ['학년','반','번호','이름','과목학년','과목학기','교과','과목명','학점'];
+  return { columns, rows: rowsOut };
+}
+
+// -------------- 파일 로드 & 시트 처리 --------------
+let _wb = null; let _cleaned = null; let _classText = null;
+const el = (id) => document.getElementById(id);
+
+// CDN 로드 실패시 사용자에게 안내
+if (typeof window !== 'undefined' && typeof window.XLSX === 'undefined'){
+  const s = document.getElementById('status');
+  if (s) s.innerHTML = '<span class="warn">XLSX 라이브러리를 불러오지 못했습니다. (CDN) — 인터넷 연결을 확인하거나 로컬 사본으로 교체하세요.</span>';
+}
+
+function setWorkbookAndPopulateSheets(wb){
+  _wb = wb;
+  const sel = el('sheet'); sel.innerHTML='';
+  _wb.SheetNames.forEach((name,i)=>{ const opt=document.createElement('option'); opt.value=name; opt.textContent=name; if(i===0) opt.selected=true; sel.appendChild(opt); });
+}
+
+function workbookFromCsvText(text){
+  const aoa = XLSX.utils.sheet_to_json(XLSX.utils.csv_to_sheet(text), { header:1, defval:null });
+  return { SheetNames: ['CSV'], Sheets: { 'CSV': XLSX.utils.aoa_to_sheet(aoa) } };
+}
+
+async function loadWorkbookFromBufferOrText(src, nameHint){
+  const lower = (nameHint || '').toLowerCase();
+  if (typeof src === 'string' || lower.endsWith('.csv')){
+    const text = typeof src === 'string' ? src : new TextDecoder('utf-8').decode(new Uint8Array(src));
+    return workbookFromCsvText(text);
+  }
+  return XLSX.read(src, { cellDates:false });
+}
+
+el('file').addEventListener('change', async (e) => {
+  try{
+    const f = e.target.files[0]; if (!f) return;
+    setStatus('파일 읽는 중…');
+    const buf = await f.arrayBuffer();
+    const wb = await loadWorkbookFromBufferOrText(buf, f.name);
+    setWorkbookAndPopulateSheets(wb);
+    setStatus(`<span class="ok">불러오기 완료</span> — 시트 ${_wb.SheetNames.length}개`);
+  }catch(err){
+    console.error(err);
+    setStatus(`<span class=\"warn\">파일 읽기 실패:</span> ${err?.message || err}`);
+  }
+});
+
+ 
+
+function readRowsFromSelectedSheet(){
+  const name = el('sheet').value || _wb.SheetNames[0];
+  const ws = _wb.Sheets[name];
+  // 상단 영역에서 학년/반 문자열 추출 (A3 우선, 이후 상단 스캔)
+  function cellVal(c){ const v = ws[c]; return v ? (v.w ?? v.v) : null; }
+  const preferred = ['A3','A2','B3','A1'];
+  let cls = null;
+  for(const addr of preferred){ const v = cellVal(addr); if (v!=null && /학|반/.test(String(v))) { cls = String(v); break; } }
+  if (!cls){
+    const cols = ['A','B','C','D','E'];
+    outer: for(let r=1;r<=8;r++){
+      for(const col of cols){ const addr = `${col}${r}`; const v = cellVal(addr); if (v==null) continue; const s = String(v); if (!/학|반/.test(s)) continue; const p = parseClassText(s); if (p.year!=null || p.klass!=null){ cls = s; break outer; } }
+    }
+  }
+  _classText = cls;
+  const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  if (!aoa.length) return [];
+  const stripS = (x) => x==null ? '' : String(x).replace(/\s+/g,'');
+  const headerCandidates = ['번호','성명','학년','학기','과목','교과'];
+  let headerIndex = 0; let maxHits = -1;
+  const scanLimit = Math.min(20, aoa.length);
+  for (let i=0; i<scanLimit; i++){
+    const row = aoa[i] || [];
+    let hits = 0;
+    for (const cell of row){ const v = stripS(cell); if (headerCandidates.includes(v)) hits++; }
+    if (hits > maxHits && hits >= 2){ headerIndex = i; maxHits = hits; }
+  }
+  const header = (aoa[headerIndex] || []).map(h => h==null?"":String(h));
+  return aoa.slice(headerIndex+1).map(arr => { const obj={}; header.forEach((h,i)=> obj[h] = i < arr.length ? arr[i] : null); return obj; });
+}
+
+function setStatus(html){ el('status').innerHTML = html; }
+
+function renderPreview(cleaned){
+  const wrap = el('preview');
+  const limit = Math.max(20, Number(el('previewCount').value) || 200);
+  const cols = cleaned.columns; const rows = cleaned.rows.slice(0, limit);
+  const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
+  const tbody = `<tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${r[c] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  wrap.innerHTML = `<table>${thead}${tbody}</table>`;
+  wrap.style.display = 'block';
+}
+
+function downloadBlob(filename, blob){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click(); URL.revokeObjectURL(a.href); }
+
+function toCsv(rows){
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const csv = XLSX.utils.sheet_to_csv(ws);
+  return new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+}
+
+function toXlsx(rows, sheetName='cleaned'){
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  const out = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+  return new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+// -------------- 이벤트 --------------
+el('btnClean').addEventListener('click', () => {
+  if (!_wb){ setStatus('<span class="warn">먼저 파일을 선택하세요.</span>'); return; }
+  const rows = readRowsFromSelectedSheet();
+  const classInfo = _classText || null;
+  _cleaned = cleanGradebook(rows, classInfo);
+  renderPreview(_cleaned);
+  setStatus(`<span class="ok">정리 완료</span> — 총 ${_cleaned.rows.length}행 (미리보기 상한 적용 중)`);
+});
+
+el('btnDownloadCsv').addEventListener('click', () => {
+  if (!_cleaned){ setStatus('<span class="warn">먼저 정리 버튼을 눌러주세요.</span>'); return; }
+  const blob = toCsv(_cleaned.rows);
+  downloadBlob('정리완료.csv', blob);
+});
+
+el('btnDownloadXlsx').addEventListener('click', () => {
+  if (!_cleaned){ setStatus('<span class="warn">먼저 정리 버튼을 눌러주세요.</span>'); return; }
+  const blob = toXlsx(_cleaned.rows);
+  downloadBlob('정리완료.xlsx', blob);
+});
+
+</script>
+</body>
+</html>
