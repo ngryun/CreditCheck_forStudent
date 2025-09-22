@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useRef, useEffect, type ReactNode } from 'react'
 import * as XLSX from 'xlsx'
 import type { Dataset, Row } from './types'
 
@@ -65,6 +65,32 @@ function canonGroup(raw: string | null): string {
   return normalized
 }
 
+// 과목명에서 위계(로마자) 수준 파싱: ex) "물리학Ⅰ" -> { base:"물리학", level:1 }
+function parseHierLevel(name: string | null): { base: string, level: number } | null {
+  if (!name) return null
+  const s = String(name).trim().normalize('NFKC')
+  // 통일: 다양한 로마자 표기를 지원 (유니코드 ⅠⅡⅢ... 및 ASCII I/V/X 조합)
+  const asciiRoman = '(?:VIII|VII|VI|IV|IX|III|II|I|X)'
+  const unicodeRoman = '[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]'
+  const re = new RegExp(`^(.*?)\s*(?:${unicodeRoman}|${asciiRoman})$`)
+  const m = s.match(re)
+  if (!m) return null
+  const tail = s.slice(m[1].length).trim()
+  const roman = tail
+  const map: Record<string, number> = {
+    // ASCII
+    'I':1,'II':2,'III':3,'IV':4,'V':5,'VI':6,'VII':7,'VIII':8,'IX':9,'X':10,
+    // Unicode Roman numerals
+    'Ⅰ':1,'Ⅱ':2,'Ⅲ':3,'Ⅳ':4,'Ⅴ':5,'Ⅵ':6,'Ⅶ':7,'Ⅷ':8,'Ⅸ':9,'Ⅹ':10,
+  }
+  const key = roman
+  const level = map[key as keyof typeof map]
+  if (!level) return null
+  const base = m[1].trim()
+  if (!base) return null
+  return { base, level }
+}
+
 function Upload({ onLoad }: { onLoad: (ds: Dataset) => void }){
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>){
     const f = e.target.files?.[0]; if(!f) return
@@ -110,11 +136,12 @@ function Kpis({ rows }: { rows: Row[] }){
   )
 }
 
-function Kpi({ title, value }: { title:string, value:string }){
+function Kpi({ title, value, note }: { title:string, value:string, note?: ReactNode }){
   return (
     <div className="kpi-card min-w-[160px]">
       <div className="kpi-title">{title}</div>
       <div className="kpi-value">{value}</div>
+      {note && <div>{note}</div>}
     </div>
   )
 }
@@ -158,19 +185,7 @@ export default function App(){
   const [data, setData] = useState<Dataset>({ rows: [] })
   const [selected, setSelected] = useState<string | null>(null)
 
-  const overall = useMemo(() => {
-    const all = data.rows
-    const totalCredits = all.reduce((s,r)=> s + (r.학점 || 0), 0)
-    const bySubject = new Map<string, { credits:number, count:number }>()
-    for (const r of all){
-      const g = canonGroup(r.교과)
-      const ent = bySubject.get(g) || { credits:0, count:0 }
-      ent.credits += (r.학점 || 0)
-      ent.count += 1
-      bySubject.set(g, ent)
-    }
-    return { totalCredits, bySubject: Array.from(bySubject, ([교과, v]) => ({ 교과, 총학점:v.credits, 건수:v.count })) }
-  }, [data])
+  // 전체 요약 제거 (요구사항 반영)
 
   const byStudent = useMemo(() => {
     const m = new Map<string, { key:string, 학년:number|null, 반:number|null, 번호:number|null, 이름:string|null, rows: Row[] }>()
@@ -213,6 +228,7 @@ export default function App(){
   }, [data])
   const [klass, setKlass] = useState<string | null>(null)
   const [query, setQuery] = useState('')
+  const listRef = useRef<HTMLDivElement | null>(null)
   const studentsInClass = useMemo(() => {
     if (!klass) return [] as { key:string, label:string }[]
     const [g,c] = klass.split('-').map(Number)
@@ -228,6 +244,25 @@ export default function App(){
     return arr
   }, [data, klass])
   const filteredStudents = studentsInClass.filter(s=> s.label.includes(query))
+  const selectedIndex = filteredStudents.findIndex(s=> s.key===selected)
+
+  function handleListKey(e: React.KeyboardEvent<HTMLDivElement>){
+    if (filteredStudents.length===0) return
+    if (e.key==='ArrowDown' || e.key==='ArrowUp'){
+      e.preventDefault()
+      let idx = selectedIndex
+      if (e.key==='ArrowDown') idx = idx<0 ? 0 : Math.min(idx+1, filteredStudents.length-1)
+      else idx = idx<0 ? 0 : Math.max(idx-1, 0)
+      const next = filteredStudents[idx]
+      if (next) setSelected(next.key)
+    }
+  }
+
+  useEffect(() => {
+    if (!selected) return
+    const el = listRef.current?.querySelector(`button[data-key="${selected}"]`) as HTMLElement | null
+    if (el) el.scrollIntoView({ block: 'nearest' })
+  }, [selected])
 
   const studentDet = selected ? byStudent.detail(selected) : null
   const studentName = useMemo(()=>{
@@ -246,7 +281,7 @@ export default function App(){
       </div>
 
       {data.rows.length>0 && (
-        <div className="grid md:grid-cols-3 gap-4 mt-4">
+        <div className="grid md:grid-cols-3 lg:grid-cols-4 gap-4 mt-4">
           <div className="md:col-span-1 card p-4">
             <div className="mb-2 font-semibold">학급 선택</div>
             <select className="select mb-3" value={klass ?? ''} onChange={(e)=> { setKlass(e.target.value || null); setSelected(null); }}>
@@ -257,9 +292,24 @@ export default function App(){
               <>
                 <div className="mb-1 font-semibold">학생 선택/검색</div>
                 <input className="input mb-2" placeholder="이름 또는 번호 검색" value={query} onChange={(e)=> setQuery(e.target.value)} />
-                <div className="max-h-64 overflow-auto border border-sage-200 rounded-lg">
+                <div
+                  className="max-h-[800px] overflow-auto border border-sage-200 rounded-lg"
+                  onKeyDown={handleListKey}
+                  tabIndex={0}
+                  ref={listRef}
+                  role="listbox"
+                  aria-activedescendant={selected ? `student-${selected}` : undefined}
+                >
                   {filteredStudents.map(s => (
-                    <button key={s.key} className={`w-full text-left px-3 py-2 hover:bg-sage-50 ${selected===s.key?'bg-sage-100':''}`} onClick={()=> setSelected(s.key)}>
+                    <button
+                      key={s.key}
+                      id={`student-${s.key}`}
+                      data-key={s.key}
+                      className={`w-full text-left px-3 py-2 hover:bg-sage-50 ${selected===s.key?'bg-sage-100':''}`}
+                      onClick={()=> setSelected(s.key)}
+                      role="option"
+                      aria-selected={selected===s.key}
+                    >
                       {s.label}
                     </button>
                   ))}
@@ -269,22 +319,7 @@ export default function App(){
             )}
           </div>
 
-          <div className="md:col-span-2 space-y-4">
-            <div className="card p-4">
-              <div className="flex items-center justify-between mb-2">
-                <div className="font-semibold">전체 요약</div>
-                <div className="text-sm text-slate-500">전체 이수학점</div>
-              </div>
-              <div className="flex gap-3 flex-wrap">
-                <Kpi title="전체 이수학점" value={String(overall.totalCredits)} />
-              </div>
-              <div className="mt-3 space-y-2">
-                {(() => { const max = Math.max(1, ...overall.bySubject.map(x=> x.총학점)); return overall.bySubject.map(x=> (
-                  <BarRow key={x.교과} label={x.교과} value={x.총학점} max={max} />
-                ))})()}
-              </div>
-            </div>
-
+          <div className="md:col-span-2 lg:col-span-3 space-y-4">
             <div className="card p-4">
               <div className="font-semibold mb-2">학생별 요약</div>
               <div className="text-sm text-slate-500 mb-3">좌측에서 학급과 학생을 선택하세요.</div>
@@ -292,7 +327,24 @@ export default function App(){
                 <div>
                   <div className="mb-2 font-semibold">{klass?.replace('-', '학년 ') + '반'} · {studentName}</div>
                   <div className="grid sm:grid-cols-2 gap-3">
-                    <Kpi title="학생 전체 이수학점" value={String(studentDet.list.reduce((s,r)=> s + (r.학점||0), 0))} />
+                    {(() => {
+                      const total = studentDet.list.reduce((s,r)=> s + (r.학점||0), 0)
+                      const foundation = new Set(['국어','수학','영어','한국사'])
+                      const base = studentDet.list.reduce((s,r)=> s + (foundation.has(r.교과) ? (r.학점||0) : 0), 0)
+                      const pct = total>0 ? Math.round((base/total)*1000)/10 : 0
+                      return (
+                        <Kpi
+                          title="학생 전체 이수학점"
+                          value={String(total)}
+                          note={
+                            <div className="mt-2">
+                              <div className="text-sm text-slate-600">기초교과</div>
+                              <div className="text-xl font-bold">{base}학점 ({pct}%)</div>
+                            </div>
+                          }
+                        />
+                      )
+                    })()}
                     <div className="card p-3">
                       <div className="text-sm text-slate-600 mb-2">교과별 이수학점</div>
                       <div className="space-y-2">
@@ -306,6 +358,44 @@ export default function App(){
                   <div className="mt-3">
                     <div className="text-sm font-semibold mb-2">과목 상세 (교과별)</div>
                     {(() => {
+                      // 위계 과목 점검
+                      const seq = (() => {
+                        const byBase = new Map<string, Set<number>>()
+                        for (const r of studentDet.list){
+                          const ph = parseHierLevel(r.과목명)
+                          if (!ph) continue
+                          const set = byBase.get(ph.base) || new Set<number>()
+                          set.add(ph.level)
+                          byBase.set(ph.base, set)
+                        }
+                        const violations: { base:string, have:number[], missing:number[] }[] = []
+                        for (const [base, set] of byBase){
+                          const levels = Array.from(set)
+                          const max = Math.max(...levels)
+                          const missing: number[] = []
+                          for (let i=1;i<max;i++) if (!set.has(i)) missing.push(i)
+                          if (missing.length>0) violations.push({ base, have: levels.sort((a,b)=>a-b), missing })
+                        }
+                        return violations
+                      })()
+                      return (
+                        <div className="card p-3 mb-3">
+                          <div className="text-sm font-semibold mb-2">위계 과목 점검</div>
+                          {seq.length===0 ? (
+                            <div className="text-sm text-slate-600">위계 위반 없음</div>
+                          ) : (
+                            <ul className="list-disc pl-5 space-y-1">
+                              {seq.map((v,i)=> (
+                                <li key={i} className="text-sm">
+                                  <span className="font-medium">{v.base}</span>: 이수 {v.have.join(', ')} → 누락 {v.missing.join(', ')}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      )
+                    })()}
+                    {(() => {
                       const groupMap = new Map<string, typeof studentDet.list>()
                       for (const r of studentDet.list){
                         const g = r.교과;
@@ -314,11 +404,11 @@ export default function App(){
                       }
                       const groups = Array.from(groupMap.entries()).sort((a,b)=> a[0].localeCompare(b[0], 'ko'))
                       return (
-                        <div className="space-y-4">
+                        <div className="grid sm:grid-cols-2 gap-4">
                           {groups.map(([g, list]) => (
                             <div key={g} className="card p-3">
                               <div className="font-semibold mb-1">{g}</div>
-                              <div className="max-h-60 overflow-auto border border-sage-200 rounded-lg">
+                              <div className="border border-sage-200 rounded-lg">
                                 <table className="w-full border-collapse">
                                   <thead>
                                     <tr>
