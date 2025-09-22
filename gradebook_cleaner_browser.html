@@ -49,11 +49,21 @@
           <input id="fileClasslist" type="file" accept=".xlsx,.xls,.csv" />
           <div class="hint">2행까지는 헤더이며 3행부터 데이터입니다.</div>
         </div>
+        <div class="full">
+          <label>교육과정 DB 업로드</label>
+          <input id="fileCurriculum" type="file" accept=".xlsx,.xls" />
+          <div class="hint">예: 교육과정편제표_2025년입학.xlsx (과목명/학점/교과/학년·학기 포함)</div>
+        </div>
+        <div class="full">
+          <label>학생 과목선택 업로드</label>
+          <input id="fileFutureSel" type="file" accept=".xlsx,.xls" />
+          <div class="hint">예: 2025입학생_수강신청일괄등록20250922.xlsx (값=1은 선택)</div>
+        </div>
         
         
         <div class="full row">
           <button id="btnClean">정리해서 미리보기</button>
-          <button id="btnDownloadCsv" class="secondary">CSV 다운로드</button>
+          <button id="btnShowReport" class="secondary">리포트 보기</button>
           <button id="btnDownloadXlsx" class="secondary">XLSX 다운로드</button>
         </div>
         
@@ -62,6 +72,7 @@
       <div id="status" class="footer" style="margin-top:16px"></div>
 
       <div id="preview" class="scroll" style="margin-top:16px; display:none"></div>
+      <div id="report" class="scroll" style="margin-top:16px; display:none"></div>
     </div>
   </div>
 
@@ -183,11 +194,19 @@ function cleanGradebook(rows, classInfo){
 let _wb = null; let _cleaned = null; let _classText = null;
 let _cleanedGB = null; // 교과학습발달상황 결과
 let _cleanedCL = null; // 학생편성현황 결과
+let _cleanedFP = null; // 미래 자료 결과
+let _catalog = null;   // 교육과정 DB 카탈로그
+const _nameIndex = new Map(); // key: G-C-N => 이름
+let _report = { future: null };
 const el = (id) => document.getElementById(id);
 
 function getCurrentData(){
   const cols = ['학년','반','번호','이름','과목학년','과목학기','교과','과목명','학점'];
-  if (_cleanedGB && _cleanedCL){ return { columns: cols, rows: [..._cleanedGB.rows, ..._cleanedCL.rows] }; }
+  let rows = [];
+  if (_cleanedGB && Array.isArray(_cleanedGB.rows)) rows.push(..._cleanedGB.rows);
+  if (_cleanedCL && Array.isArray(_cleanedCL.rows)) rows.push(..._cleanedCL.rows);
+  if (_cleanedFP && Array.isArray(_cleanedFP.rows)) rows.push(..._cleanedFP.rows);
+  if (rows.length) return { columns: cols, rows };
   if (_cleanedGB) return _cleanedGB;
   if (_cleanedCL) return _cleanedCL;
   return { columns: cols, rows: [] };
@@ -197,7 +216,8 @@ function showCurrentPreview(){
   const cur = getCurrentData();
   if (!cur.rows.length){ setStatus('<span class="warn">먼저 파일을 업로드/정리하세요.</span>'); return; }
   renderPreview(cur);
-  const src = _cleanedGB && _cleanedCL ? '통합' : (_cleanedGB ? '교과학습발달상황' : '학생편성현황');
+  const sources = [!!_cleanedGB, !!_cleanedCL, !!_cleanedFP].filter(Boolean).length;
+  const src = sources>1 ? '통합' : (_cleanedGB ? '교과학습발달상황' : (_cleanedCL ? '학생편성현황' : '미래자료'));
   setStatus(`<span class="ok">${src} 미리보기</span> — 총 ${cur.rows.length}행 (미리보기 300행 고정)`);
 }
 
@@ -286,12 +306,33 @@ function setStatus(html){ el('status').innerHTML = html; }
 
 function renderPreview(cleaned){
   const wrap = el('preview');
+  el('report').style.display = 'none';
   const limit = 300;
   const cols = cleaned.columns; const rows = cleaned.rows.slice(0, limit);
   const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
   const tbody = `<tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${r[c] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>`;
   wrap.innerHTML = `<table>${thead}${tbody}</table>`;
   wrap.style.display = 'block';
+}
+
+function renderReport(){
+  const rep = _report.future;
+  const box = el('report');
+  const wrap = el('preview');
+  if (!rep){ box.innerHTML = '<div class="hint">리포트가 없습니다. 미래 자료를 먼저 업로드하세요.</div>'; box.style.display='block'; wrap.style.display='none'; return; }
+  const rows = [];
+  rows.push(`<div class="footer">생성행: ${rep.produced||0} / 미매칭과목(카탈로그없음): ${Object.keys(rep.notInCatalog||{}).length} / 미래개설없음: ${Object.keys(rep.noFutureOffering||{}).length} / 학번없음: ${rep.skippedNoId||0}</div>`);
+  function topList(obj, title){
+    const entries = Object.entries(obj||{}).sort((a,b)=>b[1]-a[1]).slice(0,20);
+    if (!entries.length) return `<div class="hint">${title}: 없음</div>`;
+    const lis = entries.map(([k,v])=>`<tr><td>${k}</td><td style="text-align:right">${v}</td></tr>`).join('');
+    return `<div style="margin-top:8px"><div class="muted">${title} (상위 20)</div><table><thead><tr><th>과목명</th><th>건수</th></tr></thead><tbody>${lis}</tbody></table></div>`;
+  }
+  rows.push(topList(rep.notInCatalog, 'DB에 과목명이 없음'));
+  rows.push(topList(rep.noFutureOffering, '미래 개설이 없음'));
+  box.innerHTML = rows.join('');
+  box.style.display = 'block';
+  wrap.style.display = 'none';
 }
 
 function downloadBlob(filename, blob){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click(); URL.revokeObjectURL(a.href); }
@@ -329,6 +370,104 @@ function sortByGradeClassNumber(rows){
   ));
 }
 
+// ---------- 이름 인덱스 및 공통 유틸 ----------
+function keyForName(g, c, n){ if (g==null||c==null||n==null) return null; return `${g}-${c}-${n}`; }
+function updateNameIndexFrom(cleaned){
+  if (!cleaned || !cleaned.rows) return;
+  for (const r of cleaned.rows){
+    const g = toNum(r['학년']); const c = toNum(r['반']); const n = toNum(r['번호']);
+    const nm = r['이름'] ?? r['성명'] ?? null;
+    const k = keyForName(g,c,n);
+    if (k && nm && !_nameIndex.has(k)) _nameIndex.set(k, String(nm));
+  }
+}
+function resolveName(g,c,n){ const k = keyForName(g,c,n); return k?(_nameIndex.get(k)??null):null; }
+
+// ---------- 교육과정 DB ----------
+function parseYearTermFromText(txt){ if (!txt) return { y:null, t:null }; const s=String(txt); const ym=s.match(/(\d+)\s*학년/); const tm=s.match(/(\d+)\s*학기/); return { y: ym?Number(ym[1]):null, t: tm?Number(tm[1]):null } }
+function buildCurriculumCatalog(wb){
+  const name = wb.SheetNames[0]; const ws = wb.Sheets[name];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  if (!aoa.length) return {};
+  const header = (aoa[0]||[]).map(v=>v==null?'':String(v).trim());
+  const idx = (label) => header.findIndex(h=>h.replace(/\s+/g,'')===label);
+  const ixSem = idx('학기'); const ixSub = idx('과목명'); const ixCred = idx('학점'); const ixGroup = idx('교과군');
+  const cat = {};
+  for (let r=1; r<aoa.length; r++){
+    const row = aoa[r]||[];
+    const sem = ixSem>=0 ? row[ixSem] : null;
+    const {y:subYear, t:subTerm} = parseYearTermFromText(sem);
+    const subName = ixSub>=0 ? (row[ixSub]!=null?String(row[ixSub]).trim():null) : null;
+    const credit = ixCred>=0 ? toNum(row[ixCred]) : null;
+    const group = ixGroup>=0 ? (row[ixGroup]!=null?String(row[ixGroup]).trim():null) : null;
+    if (!subName) continue;
+    const rec = { 과목명: subName, 교과: group, 학점: credit, 과목학년: subYear, 과목학기: subTerm };
+    if (!cat[subName]) cat[subName] = [];
+    cat[subName].push(rec);
+  }
+  return cat;
+}
+
+// ---------- 학생 과목선택 ----------
+function isCodeLike(s){ if(!s) return false; const t=String(s).trim(); return /^(?:\d{1,4}[A-Z]|[A-Z0-9]{6,})$/.test(t) || /^\d{6,}$/.test(t); }
+function isCourseTitleLike(s){ if(!s) return false; const t=String(s).trim(); if (t==='' ) return false; if (/^[A-Z]$/.test(t)) return false; if (/^\d-\d$/.test(t)) return false; if (isCodeLike(t)) return false; return /[가-힣]/.test(t) || t.length>=2; }
+function findCourseColumns(aoa){
+  const headerRows = Math.min(4, aoa.length);
+  const cols = new Map();
+  for (let c=3; c< Math.max(...aoa.slice(0,headerRows).map(r=>r?.length||0))+5; c++){
+    let best=null; let bestLen=0; let seen=false;
+    for (let r=1; r<headerRows; r++){
+      const v = aoa[r]?.[c]; if (v==null) continue; seen=true; const s=String(v).trim();
+      if (isCourseTitleLike(s) && s.length>bestLen){ best=s; bestLen=s.length; }
+    }
+    if (seen && best){ cols.set(c, best); }
+  }
+  return cols;
+}
+function parseStudentId(id){ if (id==null) return null; const s=String(id).trim(); if (!/^\d{5}$/.test(s)) return null; const g=Number(s[0]); const c=Number(s.slice(1,3)); const n=Number(s.slice(3,5)); return {g,c,n}; }
+function buildFutureRowsFromSelections(wb){
+  if (!_catalog){ return { rows: [], stats: { noCatalog:true } }; }
+  const name = wb.SheetNames[0]; const ws = wb.Sheets[name];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  if (!aoa.length) return { rows:[], stats:{} };
+  const courseCols = findCourseColumns(aoa);
+  let start = 0;
+  for (let r=0; r<aoa.length; r++){
+    const arr = aoa[r]||[]; const a=arr[0], b=arr[1], c=arr[2];
+    const hasId = (/^\d{5}$/.test(String(a||'')) || /^\d{5}$/.test(String(b||'')) || /^\d{5}$/.test(String(c||'')) || String(a)==='0' || String(b)==='0' || String(c)==='0');
+    if (hasId){ start = r; break; }
+  }
+  const out=[]; let skippedNoId=0, skippedNoCourse=0, produced=0;
+  const notInCatalog = new Map();
+  const noFutureOffering = new Map();
+  for (let r=start; r<aoa.length; r++){
+    const arr = aoa[r]||[];
+    const id3 = parseStudentId(arr[2]); const id2 = parseStudentId(arr[1]); const id1 = parseStudentId(arr[0]);
+    const cur = id3 || id2 || id1; if (!cur){ skippedNoId++; continue; }
+    const {g,c,n} = cur;
+    const 이름 = resolveName(g,c,n);
+    for (const [ci, subName] of courseCols){
+      const v = arr[ci]; if (!(v===1 || v==='1')) continue;
+      const list = _catalog[subName];
+      if (!list){
+        skippedNoCourse++;
+        notInCatalog.set(subName, (notInCatalog.get(subName)||0)+1);
+        continue;
+      }
+      const offerings = list.filter(o => o.과목학년==null ? false : o.과목학년 >= g);
+      if (!offerings.length){
+        skippedNoCourse++;
+        noFutureOffering.set(subName, (noFutureOffering.get(subName)||0)+1);
+        continue;
+      }
+      for (const o of offerings){
+        out.push({ 학년:g, 반:c, 번호:n, 이름:이름 ?? null, 과목학년:o.과목학년 ?? null, 과목학기:o.과목학기 ?? null, 교과:o.교과 ?? null, 과목명: subName, 학점: o.학점 ?? null }); produced++;
+      }
+    }
+  }
+  return { rows: out, stats: { skippedNoId, skippedNoCourse, produced, notInCatalog: Object.fromEntries(notInCatalog), noFutureOffering: Object.fromEntries(noFutureOffering) } };
+}
+
 // -------------- 이벤트 --------------
 el('btnClean').addEventListener('click', () => {
   if (!_wb){ setStatus('<span class="warn">먼저 파일을 선택하세요.</span>'); return; }
@@ -339,12 +478,7 @@ el('btnClean').addEventListener('click', () => {
   showCurrentPreview();
 });
 
-el('btnDownloadCsv').addEventListener('click', () => {
-  const cur = getCurrentData();
-  if (!cur.rows.length){ setStatus('<span class="warn">먼저 파일을 업로드/정리하세요.</span>'); return; }
-  const blob = toCsv(cur.rows);
-  downloadBlob('정리완료.csv', blob);
-});
+
 
 el('btnDownloadXlsx').addEventListener('click', () => {
   const cur = getCurrentData();
@@ -352,6 +486,36 @@ el('btnDownloadXlsx').addEventListener('click', () => {
   const sorted = sortByGradeClassNumber(cur.rows);
   const blob = toXlsx(sorted);
   downloadBlob('정리완료.xlsx', blob);
+});
+
+el('btnShowReport').addEventListener('click', () => {
+  renderReport();
+  setStatus('<span class="ok">리포트 표시</span> — 상단에 요약/상위 항목이 보입니다');
+});
+
+// -------------- 교육과정 DB 이벤트 --------------
+el('fileCurriculum').addEventListener('change', async (e) => {
+  try{
+    const f = e.target.files[0]; if(!f) return; setStatus('교육과정 DB 읽는 중…');
+    const buf = await f.arrayBuffer(); const wb = await loadWorkbookFromBufferOrText(buf, f.name);
+    _catalog = buildCurriculumCatalog(wb);
+    setStatus(`<span class=\"ok\">교육과정 DB 로드</span> — 과목 ${Object.keys(_catalog).length}개`);
+    showCurrentPreview();
+  }catch(err){ console.error(err); setStatus(`<span class=\"warn\">교육과정 DB 실패:</span> ${err?.message||err}`); }
+});
+
+// -------------- 학생 과목선택 이벤트 --------------
+el('fileFutureSel').addEventListener('change', async (e) => {
+  try{
+    const f = e.target.files[0]; if(!f) return; setStatus('학생 과목선택 읽는 중…');
+    const buf = await f.arrayBuffer(); const wb = await loadWorkbookFromBufferOrText(buf, f.name);
+    const { rows, stats } = buildFutureRowsFromSelections(wb);
+    _cleanedFP = { columns: ['학년','반','번호','이름','과목학년','과목학기','교과','과목명','학점'], rows };
+    _report.future = stats;
+    _cleaned = _cleanedFP;
+    showCurrentPreview();
+    setStatus(`<span class=\"ok\">미래 자료 생성</span> — ${rows.length}행 (미리보기 300행 고정), 미매칭 ${stats.skippedNoCourse||0}건`);
+  }catch(err){ console.error(err); setStatus(`<span class=\"warn\">학생 과목선택 실패:</span> ${err?.message||err}`); }
 });
 
 // -------------- 학생편성현황 파서 --------------
@@ -421,6 +585,7 @@ el('fileClasslist').addEventListener('change', async (e) => {
     }
     _cleanedCL = { columns: ['학년','반','번호','이름','과목학년','과목학기','교과','과목명','학점'], rows: outRows };
     _cleaned = _cleanedCL;
+    try{ updateNameIndexFrom(_cleanedCL); }catch(_){ }
     showCurrentPreview();
   }catch(err){
     console.error(err);
