@@ -1,4 +1,5 @@
 import { useMemo, useState, useRef, useEffect, type ReactNode } from 'react'
+import rawPrereqs from './prereqs.json'
 import * as XLSX from 'xlsx'
 import type { Dataset, Row } from './types'
 
@@ -56,6 +57,7 @@ function canonGroup(raw: string | null): string {
     cmp === target ||
     cmp === '교양' ||
     cmp === '제2외국어' ||
+    cmp === '제2외국어/한문' ||
     cmp === '한문' ||
     cmp === '기술・가정' ||
     cmp === '기술・가정/정보'
@@ -90,6 +92,34 @@ function parseHierLevel(name: string | null): { base: string, level: number } | 
   if (!base) return null
   return { base, level }
 }
+
+// 과목명 정규화(선후수 매칭용): 폭/공백/괄호 내부 공백 통일
+function normCourseName(name: string | null): string | null {
+  if (!name) return null
+  return String(name)
+    .trim()
+    .normalize('NFKC')
+    .replace(/\(([^)]*)\)/g, (_m, inner) => `(${String(inner).replace(/\s+/g, '')})`)
+}
+
+// 한국사 과목명 판별: 한국사, 한국사1, 한국사2
+function isKoreanHistory(name: string | null): boolean {
+  if (!name) return false
+  const s = String(name).trim().normalize('NFKC')
+  return s === '한국사' || s === '한국사1' || s === '한국사2'
+}
+
+// JSON 선후수 규칙을 정규화한 맵으로 준비
+const PREREQS = (() => {
+  const m = new Map<string, string[]>()
+  for (const [k, arr] of Object.entries(rawPrereqs as Record<string, string[]>)){
+    const nk = normCourseName(k)
+    if (!nk) continue
+    const reqs = arr.map(normCourseName).filter((x): x is string => Boolean(x))
+    m.set(nk, reqs)
+  }
+  return m
+})()
 
 function Upload({ onLoad }: { onLoad: (ds: Dataset) => void }){
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>){
@@ -264,6 +294,102 @@ export default function App(){
     if (el) el.scrollIntoView({ block: 'nearest' })
   }, [selected])
 
+  // 내보내기: 전체 학생 요약 XLSX 생성
+  function exportAll(){
+    const rows = data.rows
+    if (!rows.length) return
+    // 모든 교과 그룹 컬럼 수집
+    const groupSet = new Set<string>()
+    for (const r of rows){ groupSet.add(canonGroup(r.교과)) }
+    const groups = Array.from(groupSet).sort((a,b)=> a.localeCompare(b, 'ko'))
+
+    // 학생별 집계 준비
+    const byStu = new Map<string, { 학년:number|null, 반:number|null, 번호:number|null, 이름:string|null, list: Row[] }>()
+    for (const r of rows){
+      if (r.학년==null || r.반==null || r.번호==null) continue
+      const key = `${r.학년}-${r.반}-${r.번호}`
+      const ent = byStu.get(key) || { 학년:r.학년, 반:r.반, 번호:r.번호, 이름:r.이름 ?? null, list: [] }
+      ent.list.push(r)
+      byStu.set(key, ent)
+    }
+    const foundation = new Set(['국어','수학','영어'])
+
+    // 헤더
+    const header = ['학년','반','번호','이름', ...groups, '전체이수학점','기초교과학점','한국사학점','기초교과+한국사비율(%)','점검']
+    const aoa: any[][] = [header]
+
+    // 위계/선후수 점검 헬퍼
+    function buildChecks(list: { 과목명:string, 교과:string, 학점:number, 과목학년:number|null, 과목학기:number|null }[]){
+      // 로마자 위계
+      const byBase = new Map<string, Set<number>>()
+      for (const r of list){
+        const ph = parseHierLevel(r.과목명)
+        if (!ph) continue
+        const set = byBase.get(ph.base) || new Set<number>()
+        set.add(ph.level)
+        byBase.set(ph.base, set)
+      }
+      const seqParts: string[] = []
+      for (const [base, set] of byBase){
+        const levels = Array.from(set)
+        const max = Math.max(...levels)
+        const missing: number[] = []
+        for (let i=1;i<max;i++) if (!set.has(i)) missing.push(i)
+        if (missing.length>0) seqParts.push(`${base}: 누락 ${missing.join(', ')}`)
+      }
+      // JSON 선후수
+      const have = new Set<string>()
+      for (const r of list){ const nm = normCourseName(r.과목명); if (nm) have.add(nm) }
+      const explicitParts: string[] = []
+      for (const [course, reqs] of PREREQS){
+        if (!have.has(course)) continue
+        const miss = reqs.filter(r => !have.has(r))
+        if (miss.length>0) explicitParts.push(`${course}: 선수 누락 → ${miss.join(', ')}`)
+      }
+      const parts = [] as string[]
+      if (seqParts.length) parts.push(`로마자 위계 위반: ${seqParts.join('; ')}`)
+      if (explicitParts.length) parts.push(explicitParts.join('; '))
+      return parts.join(' | ')
+    }
+
+    // 각 학생 행 생성
+    const keys = Array.from(byStu.keys()).sort((a,b)=> {
+      const [ag,ac,an] = a.split('-').map(Number); const [bg,bc,bn] = b.split('-').map(Number)
+      return (ag-bg) || (ac-bc) || (an-bn)
+    })
+    for (const key of keys){
+      const s = byStu.get(key)!;
+      const list = s.list.map(r => ({
+        교과: canonGroup(r.교과),
+        과목명: r.과목명 || '',
+        학점: r.학점 || 0,
+        과목학년: r.과목학년 ?? null,
+        과목학기: r.과목학기 ?? null,
+      }))
+      const grp = new Map<string, number>()
+      for (const r of list){ grp.set(r.교과, (grp.get(r.교과)||0) + (r.학점 || 0)) }
+      const total = list.reduce((sum,r)=> sum + (r.학점||0), 0)
+      const baseOnly = list.reduce((sum,r)=> sum + (foundation.has(r.교과) ? (r.학점||0) : 0), 0)
+      const khOnly = list.reduce((sum,r)=> sum + (isKoreanHistory(r.과목명) ? (r.학점||0) : 0), 0)
+      const pct = total>0 ? Math.round(((baseOnly+khOnly)/total)*1000)/10 : 0
+      const checkParts: string[] = []
+      const hierarchyCheck = buildChecks(list)
+      if (hierarchyCheck) checkParts.push(hierarchyCheck)
+      if (pct > 50) checkParts.push('기초교과 비율 초과')
+      const check = checkParts.join(' | ')
+
+      const row: any[] = [s.학년, s.반, s.번호, s.이름 ?? '']
+      for (const g of groups){ row.push(grp.get(g) || 0) }
+      row.push(total, baseOnly, khOnly, pct, check)
+      aoa.push(row)
+    }
+
+    const ws = XLSX.utils.aoa_to_sheet(aoa)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, '학생별 요약')
+    XLSX.writeFile(wb, '학생별_요약.xlsx', { compression: true })
+  }
+
   const studentDet = selected ? byStudent.detail(selected) : null
   const studentName = useMemo(()=>{
     if (!selected) return ''
@@ -276,7 +402,12 @@ export default function App(){
       <h1 className="text-2xl font-bold mb-1">과목선택 점검 대시보드</h1>
       <div className="text-slate-600 mb-3">정리완료.xlsx(고정 스키마) 파일을 업로드해 학급/학생별 이수현황을 살펴보세요.</div>
       <div className="card p-4">
-        <Upload onLoad={(ds)=> { setData(ds); setKlass(null); setSelected(null); }} />
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <Upload onLoad={(ds)=> { setData(ds); setKlass(null); setSelected(null); }} />
+          {data.rows.length>0 && (
+            <button className="btn btn-primary" onClick={exportAll}>내보내기 (전체 학생 XLSX)</button>
+          )}
+        </div>
         {data.rows.length>0 && <Kpis rows={data.rows} />}
       </div>
 
@@ -329,17 +460,23 @@ export default function App(){
                   <div className="grid sm:grid-cols-2 gap-3">
                     {(() => {
                       const total = studentDet.list.reduce((s,r)=> s + (r.학점||0), 0)
-                      const foundation = new Set(['국어','수학','영어','한국사'])
-                      const base = studentDet.list.reduce((s,r)=> s + (foundation.has(r.교과) ? (r.학점||0) : 0), 0)
-                      const pct = total>0 ? Math.round((base/total)*1000)/10 : 0
+                      const foundation = new Set(['국어','수학','영어'])
+                      const baseOnly = studentDet.list.reduce((s,r)=> s + (foundation.has(r.교과) ? (r.학점||0) : 0), 0)
+                      const khOnly = studentDet.list.reduce((s,r)=> s + (isKoreanHistory(r.과목명) ? (r.학점||0) : 0), 0)
+                      const combined = baseOnly + khOnly
+                      const pct = total>0 ? Math.round((combined/total)*1000)/10 : 0
                       return (
                         <Kpi
                           title="학생 전체 이수학점"
                           value={String(total)}
                           note={
                             <div className="mt-2">
-                              <div className="text-sm text-slate-600">기초교과</div>
-                              <div className="text-xl font-bold">{base}학점 ({pct}%)</div>
+                              <div className="text-sm text-slate-600">기초교과+한국사</div>
+                              <div className="text-xl font-bold">
+                                {baseOnly}학점 + {khOnly}학점 (
+                                <span className={pct > 50 ? 'text-red-600' : ''}>{pct}%</span>
+                                )
+                              </div>
                             </div>
                           }
                         />
@@ -378,16 +515,44 @@ export default function App(){
                         }
                         return violations
                       })()
+                      // JSON 선후수 점검
+                      const explicit = (() => {
+                        const have = new Set<string>()
+                        for (const r of studentDet.list){
+                          const nm = normCourseName(r.과목명)
+                          if (nm) have.add(nm)
+                        }
+                        const out: { course: string, missing: string[] }[] = []
+                        for (const [course, reqs] of PREREQS){
+                          if (!have.has(course)) continue
+                          const miss = reqs.filter(r => !have.has(r))
+                          if (miss.length>0) out.push({ course, missing: miss })
+                        }
+                        return out
+                      })()
                       return (
                         <div className="card p-3 mb-3">
                           <div className="text-sm font-semibold mb-2">위계 과목 점검</div>
-                          {seq.length===0 ? (
-                            <div className="text-sm text-slate-600">위계 위반 없음</div>
-                          ) : (
+                          {seq.length===0 && explicit.length===0 && (
+                            <div className="text-sm text-slate-600">위계/선후수 위반 없음</div>
+                          )}
+                          {seq.length>0 && (
+                            <>
+                              <div className="text-sm text-slate-700 font-medium mb-1">로마자 위계 위반</div>
+                              <ul className="list-disc pl-5 space-y-1 mb-2">
+                                {seq.map((v,i)=> (
+                                  <li key={i} className="text-sm">
+                                    <span className="font-medium">{v.base}</span>: 이수 {v.have.join(', ')} → 누락 {v.missing.join(', ')}
+                                  </li>
+                                ))}
+                              </ul>
+                            </>
+                          )}
+                          {explicit.length>0 && (
                             <ul className="list-disc pl-5 space-y-1">
-                              {seq.map((v,i)=> (
+                              {explicit.map((v,i)=> (
                                 <li key={i} className="text-sm">
-                                  <span className="font-medium">{v.base}</span>: 이수 {v.have.join(', ')} → 누락 {v.missing.join(', ')}
+                                  <span className="font-medium">{v.course}</span>: 선수 누락 → {v.missing.join(', ')}
                                 </li>
                               ))}
                             </ul>
@@ -405,7 +570,15 @@ export default function App(){
                       const groups = Array.from(groupMap.entries()).sort((a,b)=> a[0].localeCompare(b[0], 'ko'))
                       return (
                         <div className="grid sm:grid-cols-2 gap-4">
-                          {groups.map(([g, list]) => (
+                          {groups.map(([g, list]) => {
+                            const sorted = [...list].sort((a,b) => {
+                              const ay = a.과목학년 ?? 9999; const by = b.과목학년 ?? 9999
+                              if (ay !== by) return ay - by
+                              const at = a.과목학기 ?? 9999; const bt = b.과목학기 ?? 9999
+                              if (at !== bt) return at - bt
+                              return (a.과목명 || '').localeCompare(b.과목명 || '', 'ko')
+                            })
+                            return (
                             <div key={g} className="card p-3">
                               <div className="font-semibold mb-1">{g}</div>
                               <div className="border border-sage-200 rounded-lg">
@@ -419,7 +592,7 @@ export default function App(){
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {list.map((r,i) => (
+                                    {sorted.map((r,i) => (
                                       <tr key={i} className="odd:bg-white even:bg-sage-50/30">
                                         <td className="p-2 border-b border-sage-100">{r.과목명}</td>
                                         <td className="p-2 border-b border-sage-100 text-right">{r.학점}</td>
@@ -431,7 +604,8 @@ export default function App(){
                                 </table>
                               </div>
                             </div>
-                          ))}
+                            )
+                          })}
                         </div>
                       )
                     })()}
